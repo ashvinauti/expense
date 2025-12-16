@@ -32,12 +32,8 @@ if not DB_URL:
     DB_URL = f"sqlite:///{DB_PATH}"
 
 engine = create_engine(DB_URL, future=True)
-
 metadata = MetaData()
 
-# Tables (DB-agnostic)
-# Keep date as ISO string (YYYY-MM-DD) for simple cross-DB filtering by string range
-from sqlalchemy import Table
 transactions = Table(
     "transactions", metadata,
     Column("id", Integer, primary_key=True, autoincrement=True),
@@ -45,7 +41,7 @@ transactions = Table(
     Column("account", String),
     Column("merchant", String),
     Column("category", String),
-    Column("type", String, nullable=False),  # Expense | Income | Transfer
+    Column("type", String, nullable=False),
     Column("method", String),
     Column("amount", Float, nullable=False),
     Column("notes", Text),
@@ -83,7 +79,7 @@ DEFAULT_BUDGETS = {
     "Rent": 600,
     "Groceries": 200,
     "Travel": 150,
-    "Subscriptions": 165,  # Galaxy AI 15 + Lenses 20 + Insurance 80 + Other 50
+    "Subscriptions": 165,
     "Debt Payments": 0,
     "Dining & Coffee": 100,
     "Shopping": 50,
@@ -141,8 +137,10 @@ def delete_transactions(ids):
     if not ids:
         return
     with engine.begin() as conn:
-        conn.execute(text("DELETE FROM transactions WHERE id = ANY(:ids)"), {"ids": ids}) if engine.url.get_backend_name() in ["postgresql"] else \
-        conn.execute(text("DELETE FROM transactions WHERE id IN :ids").bindparams(bindparam("ids", expanding=True)), {"ids": ids})
+        if engine.url.get_backend_name() in ["postgresql"]:
+            conn.execute(text("DELETE FROM transactions WHERE id = ANY(:ids)"), {"ids": ids})
+        else:
+            conn.execute(text("DELETE FROM transactions WHERE id IN :ids").bindparams(bindparam("ids", expanding=True)), {"ids": ids})
 
 def read_budgets():
     return pd.read_sql(text("SELECT * FROM budgets"), engine)
@@ -154,7 +152,6 @@ def upsert_budget(cat, planned):
             conn.execute(text("INSERT INTO budgets (category, planned) VALUES (:c,:p) ON CONFLICT(category) DO UPDATE SET planned = excluded.planned"),
                          {"c": cat, "p": float(planned)})
         else:
-            # Fallback: try update then insert if no row
             n = conn.execute(text("UPDATE budgets SET planned=:p WHERE category=:c"), {"c":cat,"p":float(planned)}).rowcount
             if n == 0:
                 conn.execute(text("INSERT INTO budgets (category, planned) VALUES (:c,:p)"), {"c":cat,"p":float(planned)})
@@ -187,7 +184,6 @@ def post_due_subs(ym: str):
 
 def import_csv(file, ym_target=None):
     df = pd.read_csv(file)
-    # Expected columns: date, account, merchant, category, type, method, amount, [notes]
     cols = {c.lower().strip(): c for c in df.columns}
     req = ["date","account","merchant","category","type","method","amount"]
     for r in req:
@@ -246,7 +242,7 @@ with tab1:
         category = c4.selectbox("Category", CATEGORIES, index=CATEGORIES.index("Groceries") if "Groceries" in CATEGORIES else 0)
         ttype = c5.selectbox("Type", TYPES, index=0)
         amount = c6.number_input("Amount (£)", min_value=0.0, step=0.50, value=0.0, format="%.2f")
-        notes = st.text_area("Notes", height=60)
+        notes = st.text_area("Notes", height=100)  # FIX: height >= 68px
         submitted = st.form_submit_button("Add")
         if submitted:
             if amount <= 0:
@@ -305,7 +301,6 @@ with tab3:
     if df.empty:
         st.info("No data for this month yet. Add transactions in the first tab.")
     else:
-        # Summary
         total_income = df.loc[df["type"]=="Income","amount"].sum()
         total_expense = df.loc[df["type"]=="Expense","amount"].sum()
         net = (total_income - total_expense)
@@ -315,11 +310,10 @@ with tab3:
         c2.metric("Total Expenses", f"£{total_expense:,.2f}")
         c3.metric("Net Cash Flow", f"£{net:,.2f}")
 
-        # Category chart
         by_cat = df[df["type"]=="Expense"].groupby("category")["amount"].sum().reset_index()
         by_cat = by_cat.sort_values("amount", ascending=False)
-        budgets = read_budgets()
-        by_cat = by_cat.merge(budgets, on="category", how="left").rename(columns={"planned":"budget"})
+        budgets_df = read_budgets()
+        by_cat = by_cat.merge(budgets_df, on="category", how="left").rename(columns={"planned":"budget"})
         by_cat["variance"] = by_cat["budget"].fillna(0) - by_cat["amount"]
 
         st.markdown("#### Spending by category")
@@ -332,7 +326,6 @@ with tab3:
         ).properties(height=350)
         st.altair_chart(chart, use_container_width=True)
 
-        # 6-month trend (build from all data in DB)
         all_df = pd.read_sql(text("SELECT date, type, amount FROM transactions"), engine)
         if not all_df.empty:
             all_df["ym"] = pd.to_datetime(all_df["date"]).dt.strftime("%Y-%m")
